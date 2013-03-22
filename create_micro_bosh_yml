@@ -1,0 +1,163 @@
+#!/usr/bin/env ruby
+
+require "fileutils"
+
+def usage
+  $stderr.puts "USAGE:"
+  $stderr.puts "  For AWS: create_micro_bosh_yml NAME aws ACCESS_KEY SECRET_KEY REGION KEYNAME SECURITY_GROUP IP_ADDRESS RAW_PASSWORD"
+  $stderr.puts "  For OpenStack: create_micro_bosh_yml NAME openstack NAME OS_USERNAME OS_PASSWORD OS_TENANT_NAME OS_AUTH_URL KEYNAME IP_ADDRESS RAW_PASSWORD"
+  exit 1
+end
+
+name     = ARGV.shift
+provider = ARGV.shift
+usage unless provider
+case provider.upcase
+  when "AWS"
+    access_key     = ARGV.shift
+    secret_key     = ARGV.shift
+    region         = ARGV.shift
+    keypair_name   = ARGV.shift
+    security_group = ARGV.shift
+    ipaddress      = ARGV.shift
+    password       = ARGV.shift
+  when "OPENSTACK"
+    os_username    = ARGV.shift
+    os_password    = ARGV.shift
+    os_tenant_name = ARGV.shift
+    os_auth_url    = ARGV.shift
+    keypair_name   = ARGV.shift
+    ipaddress      = ARGV.shift
+    password       = ARGV.shift
+  else usage
+end
+usage unless keypair_name
+
+def salted_password(password)
+  `mkpasswd -m sha-512 '#{password}'`.strip
+end
+
+def aws_config_yml(name, access_key, secret_key, region, key_name, security_group, ipaddress, salted_password, options={})
+
+  # sanity checks
+  raise "Something went wrong. This is not a salted password: " +
+        "#{salted_password}" unless salted_password.start_with?("$")
+  require 'ipaddr'
+  IPAddr.new ipaddress
+
+  availability_zone = options[:availability_zone] || "#{region}a"
+  instance_type     = options[:instance_type] || 'm1.small'
+  persistent_disk   = options[:persistent_disk] || 8192
+  <<-YAML
+---
+name: #{name}
+
+env:
+  bosh:
+    password: #{salted_password}
+
+logging:
+  level: DEBUG
+
+network:
+  type: dynamic
+  vip: #{ipaddress}
+
+resources:
+  persistent_disk: #{persistent_disk}
+  cloud_properties:
+    instance_type: #{instance_type}
+    availability_zone: #{availability_zone}
+
+cloud:
+  plugin: aws
+  properties:
+    aws:
+      access_key_id:     #{access_key}
+      secret_access_key: #{secret_key}
+      ec2_endpoint: ec2.#{region}.amazonaws.com
+      default_key_name: #{key_name}
+      default_security_groups: ["#{security_group}"]
+      ec2_private_key: /home/vcap/.ssh/#{key_name}.pem
+
+apply_spec:
+  agent:
+    blobstore:
+      address: #{ipaddress}
+    nats:
+      address: #{ipaddress}
+  properties:
+    aws_registry:
+      address: #{ipaddress}
+YAML
+end
+
+def openstack_config_yml(name, username, api_key, tenant, auth_url, key_name, ipaddress, salted_password, options={})
+
+  # sanity checks
+  raise "Something went wrong. This is not a salted password: " +
+        "#{salted_password}" unless salted_password.start_with?("$")
+  require 'ipaddr'
+  IPAddr.new ipaddress
+
+  security_group  = options[:security_group] || 'default'
+  instance_type   = options[:instance_type] || 'm1.small'
+  persistent_disk = options[:persistent_disk] || 4096
+  <<-YAML
+---
+name: #{name}
+
+env:
+  bosh:
+    password: #{salted_password}
+
+logging:
+  level: DEBUG
+
+network:
+  type: dynamic
+  label: private
+  vip: #{ipaddress}
+
+resources:
+  persistent_disk: #{persistent_disk}
+  cloud_properties:
+    instance_type: #{instance_type}
+
+cloud:
+  plugin: openstack
+  properties:
+    openstack:
+      auth_url: #{auth_url}
+      username: #{username}
+      api_key:  #{api_key}
+      tenant:   #{tenant}
+      default_key_name: #{key_name}
+      default_security_groups: ["#{security_group}"]
+      private_key: /home/vcap/.ssh/#{key_name}.pem
+
+apply_spec:
+  agent:
+    blobstore:
+      address: #{ipaddress}
+    nats:
+      address: #{ipaddress}
+  properties: {}
+YAML
+end
+
+
+salty = salted_password(password)
+yml = case provider.upcase
+  when "AWS"
+    aws_config_yml(name, access_key, secret_key, region, keypair_name, security_group, ipaddress, salty, options={})
+  when "OPENSTACK"
+    openstack_config_yml(name, os_username, os_password, os_tenant_name, os_auth_url, keypair_name, ipaddress, salty, options={})
+  else usage
+end
+
+deployment_dir = File.join("/var", "vcap", "deployments", name)
+FileUtils.mkdir_p(deployment_dir)
+micro_bosh_yml = File.join(deployment_dir, "micro_bosh.yml")
+File.open(micro_bosh_yml, "w") { |f| f << yml }
+$stderr.puts "Created #{micro_bosh_yml}..."
